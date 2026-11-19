@@ -21,16 +21,18 @@ db.executescript('''
 CREATE TABLE IF NOT EXISTS needs (id INTEGER PRIMARY KEY, name TEXT UNIQUE, active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS visits (id INTEGER PRIMARY KEY, need INTEGER NOT NULL, donor INTEGER NOT NULL, person TEXT NOT NULL, arrival TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, person TEXT NOT NULL, text TEXT NOT NULL, created TEXT NOT NULL);
 ''')
 db.commit()
 dp = Dispatcher()
 editing = set()
+writing_feedback = set()
 
 def keyboard(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=c) for t, c in row] for row in rows])
 
 def menu():
-    return keyboard([[('🐾 Нужды приюта', 'needs')], [('ℹ️ О приюте и контакты', 'info')]])
+    return keyboard([[('🐾 Нужды приюта', 'needs')], [('ℹ️ О приюте и контакты', 'info')], [('💬 Оставить отзыв', 'feedback')]])
 
 def now():
     return datetime.now(TZ)
@@ -56,7 +58,24 @@ async def admin(message: Message):
 
 @dp.message(F.text)
 async def update_needs(message: Message):
-    if message.from_user.id not in editing or message.from_user.id not in STAFF:
+    uid = message.from_user.id
+    if uid in writing_feedback:
+        text = message.text.strip()
+        if not text:
+            await message.answer('Отзыв не должен быть пустым.')
+            return
+        person = message.from_user.full_name + (f' (@{message.from_user.username})' if message.from_user.username else f' (ID {uid})')
+        with db:
+            db.execute('INSERT INTO feedback (user_id, person, text, created) VALUES (?, ?, ?, ?)', (uid, person, text, now().isoformat()))
+        writing_feedback.discard(uid)
+        await message.answer('Спасибо за отзыв!', reply_markup=menu())
+        for staff in STAFF:
+            try:
+                await message.bot.send_message(staff, f'Новый отзыв от {person}:\n{text}')
+            except Exception:
+                logging.exception('Не удалось отправить отзыв волонтёру %s', staff)
+        return
+    if uid not in editing or uid not in STAFF:
         return
     names = list(dict.fromkeys(line.strip() for line in message.text.splitlines() if line.strip()))
     if not names:
@@ -76,6 +95,19 @@ async def callback_menu(q: CallbackQuery, bot: Bot):
     data = q.data or ''
     uid = q.from_user.id
     await q.message.answer('Выберите раздел:', reply_markup=menu())
+
+@dp.callback_query(F.data == 'feedback')
+async def callback_feedback(q: CallbackQuery):
+    await q.answer()
+    editing.discard(q.from_user.id)
+    writing_feedback.add(q.from_user.id)
+    await q.message.answer('Напишите отзыв одним сообщением.', reply_markup=keyboard([[('Отмена', 'cancel_feedback')]]))
+
+@dp.callback_query(F.data == 'cancel_feedback')
+async def callback_cancel_feedback(q: CallbackQuery):
+    await q.answer()
+    writing_feedback.discard(q.from_user.id)
+    await q.message.answer('Отправка отзыва отменена.', reply_markup=menu())
 
 @dp.callback_query(F.data == 'info')
 async def callback_info(q: CallbackQuery, bot: Bot):
@@ -103,6 +135,7 @@ async def callback_edit(q: CallbackQuery, bot: Bot):
     uid = q.from_user.id
     if uid not in STAFF:
         return
+    writing_feedback.discard(uid)
     editing.add(uid)
     await q.message.answer('Пришлите новый список нужд: по одной позиции на строку. Он полностью заменит текущий список.')
 
